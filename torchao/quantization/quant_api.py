@@ -40,6 +40,7 @@ from torchao.dtypes import (
     PlainLayout,
     QDQLayout,
     SemiSparseLayout,
+    CSRLayout,
     TensorCoreTiledLayout,
     UintxLayout,
     to_affine_quantized_floatx,
@@ -2004,3 +2005,11 @@ if TORCH_VERSION_AT_LEAST_2_5:
             Target,
         ]
     )
+
+if TORCH_VERSION_AT_LEAST_2_4: # torch with sparse csr support  
+    from torchao.dtypes.uintx.csr_layout import (
+        CSRLayout,
+        _linear_int8_act_int8_weight_csr_sparse_check as _csr_check,
+        _linear_int8_act_int8_weight_csr_sparse_impl  as _csr_impl,
+    )
+    # torch._dynamo.register_dynamic_rule(_csr_check, _csr_impl)

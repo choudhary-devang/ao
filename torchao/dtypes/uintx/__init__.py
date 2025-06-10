@@ -27,6 +27,9 @@ from .q_dq_layout import (
 from .semi_sparse_layout import (
     SemiSparseLayout,
 )
+from .csr_layout import (
+    CSRLayout,
+)
 from .tensor_core_tiled_layout import (
     TensorCoreTiledLayout,
 )
@@ -39,6 +42,7 @@ __all__ = [
     "BlockSparseLayout",
     "MarlinSparseLayout",
     "SemiSparseLayout",
+    "CSRLayout",
     "TensorCoreTiledLayout",
     "Int4CPULayout",
     "MarlinQQQLayout",

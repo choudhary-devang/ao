@@ -118,15 +118,47 @@ class CSRLayout(Layout):
     The layout itself is **stateless**; all structural metadata (crow_indices,
     col_indices) lives inside the associated ``TensorImpl``.
     """
-
     def pre_process(self, input: torch.Tensor) -> torch.Tensor:
-        """Optionally prune *very small* weights to zero.
+            """Magnitude‑based pruning prior to CSR packing.
 
-        Developers may plug in magnitude pruning or learnable sparsity here.
-        For now we simply return the input unchanged so users can control the
-        sparsity schedule externally.
-        """
-        return input
+            Parameters
+            ----------
+            input : torch.Tensor
+                A **dense** weight matrix (any dtype) that we intend to quantise
+                and pack as CSR.  The function returns a *copy* with elements below
+                a global magnitude threshold set to zero so that subsequent
+                `torch._to_csr` compression produces the desired sparsity.
+
+            Heuristic
+            ---------
+            *Prune* the smallest‑magnitude values until we reach the *target
+            sparsity* fraction.  The target defaults to **90 %** but can be
+            overridden by setting the environment variable
+            ``TORCHAO_CSR_TARGET_SPARSITY`` (float in 0 – 1).  If the target is
+            outside that range the function becomes a no‑op and simply returns the
+            input unchanged.
+            """
+            import os
+
+            target = float(os.getenv("TORCHAO_CSR_TARGET_SPARSITY", "0.9"))
+            # Validate target range; fall back to no pruning if mis‑configured
+            if not (0.0 < target < 1.0):
+                return input
+
+            # Clone to avoid mutating the caller's tensor in‑place
+            temp = input.detach().clone()
+
+            # Compute global threshold that keeps the largest (1‑target) fraction
+            flat = temp.abs().view(-1)
+            k = int(flat.numel() * (1 - target))
+            if k <= 0:  # requested sparsity so high that everything would be zero
+                return temp.zero_()
+
+            # `kthvalue` is 1‑indexed: kthvalue(1) gives minimum, kthvalue(n) max
+            thresh = flat.kthvalue(k).values
+            mask = temp.abs() >= thresh
+            temp.mul_(mask)
+            return temp
 
 
 @register_layout(CSRLayout)
