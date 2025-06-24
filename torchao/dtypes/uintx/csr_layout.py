@@ -113,7 +113,7 @@ def _linear_int8_act_int8_weight_csr_sparse_impl(
 
 @dataclass(frozen=True)
 class CSRLayout(Layout):
-    """Layout marker for *Compressed Sparse Row* INT8 matrices.
+    """Layout marker for *Compressed Sparse Row* INT8 weights.
 
     The layout itself is **stateless**; all structural metadata (crow_indices,
     col_indices) lives inside the associated ``TensorImpl``.
@@ -138,6 +138,7 @@ class CSRLayout(Layout):
             outside that range the function becomes a no‑op and simply returns the
             input unchanged.
             """
+            print("we are in pre_process function")
             import os
 
             target = float(os.getenv("TORCHAO_CSR_TARGET_SPARSITY", "0.9"))
@@ -177,7 +178,7 @@ class CSR_AQTTensorImpl(PlainAQTTensorImpl):
     @classmethod
     def __torch_dispatch__(cls, func, types, args, kwargs):
         kwargs = kwargs or {}
-
+        print("in __torch_dispatch function")
         if func is aten.detach.default:
             return return_and_correct_aliasing(
                 func, args, kwargs, args[0]._apply_fn_to_data(torch.detach)
@@ -195,6 +196,7 @@ class CSR_AQTTensorImpl(PlainAQTTensorImpl):
         This is a slow path used by debugging utilities (e.g. ``to_dense()``).
         We materialise the CSR tensor to dense form.
         """
+        print("we are in get_plain function\n")
         int_data_expanded = self.int_data.to_dense()
         return int_data_expanded, self.scale, self.zero_point
 
@@ -208,13 +210,14 @@ class CSR_AQTTensorImpl(PlainAQTTensorImpl):
         zero_point: Optional[torch.Tensor],
         _layout: Layout,
     ):
+        print("we are in from_plain")
         """Pack a *dense* INT8 matrix ``int_data`` into CSR layout."""
         assert isinstance(_layout, CSRLayout), "layout must be CSRLayout"
 
         # Use PyTorch util to convert to CSR; keep on same device / dtype.
         # Suggestion: ensure row-major order (out_features × in_features).
-        csr_tensor = torch._to_csr(int_data) if hasattr(torch, "_to_csr") else (
-            torch.sparse_csr_tensor(*torch._convert_indices_from_coo_to_csr(int_data))
-        )
 
+        # 1) optional magnitude pruning (user-controlled env var)
+        pruned = _layout.pre_process(int_data)     # returns dense tensor
+        csr_tensor = pruned.to_sparse_csr() 
         return cls(csr_tensor, scale, zero_point, _layout)
