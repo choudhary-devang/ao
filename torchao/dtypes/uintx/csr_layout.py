@@ -93,9 +93,15 @@ def _linear_int8_act_int8_weight_csr_sparse_impl(
     # Reshape activations to 2-D (batch*seqlen, in_features)
     x2d = x_vals_int8.reshape(-1, x_vals_int8.shape[-1]).to(torch.int32)
 
+    A = torch.rand(768, 768, dtype=torch.float32)
+    mask = torch.rand(768, 768) < (1 - 0.70)
+    A = A * mask
+    S = A.to_sparse_csr()
+    B = torch.rand(768, 128, dtype=torch.float32)
     # Sparse matmul (int8*int8 -> int32).  PyTorch up-casts INT8 CSR to INT32
     # during mm; if vendor kernel is registered this will be replaced at runtime.
-    y_int32 = torch.sparse.mm(w_csr.to(torch.int32), x2d.t()).t()
+    _=torch.mm(S,B)
+    y_int32 = torch.mm(w_csr.to(torch.float32), x2d.t().to(torch.float32).contiguous()).t()
 
     # Dequantise: y = (x_scale * w_scale) * y_int32
     y_fp32 = (y_int32.to(torch.float32) * x_scale * w_scale).reshape(
@@ -171,6 +177,20 @@ class CSR_AQTTensorImpl(PlainAQTTensorImpl):
     usual quantisation scale & zero-point.
     """
 
+    # NEW — provide a Python attribute so AffineQuantizedTensor
+    # can fetch the layout without touching the C++ side.
+    @property
+    def layout(self):
+        """
+        Return a *torch.layout* enum so that
+        `AffineQuantizedTensor.__new__` can forward it to
+        `torch.Tensor._make_wrapper_subclass` without type errors.
+
+        Note: the **custom** sparsity marker we care about
+        (`CSRLayout()` instance) is still stored in `self._layout`.
+        """
+        return torch.sparse_csr
+    
     # ------------------------------------------------------------------
     # Override torch dispatch for basic ops we need (detach, to_plain).
     # ------------------------------------------------------------------
@@ -220,4 +240,5 @@ class CSR_AQTTensorImpl(PlainAQTTensorImpl):
         # 1) optional magnitude pruning (user-controlled env var)
         pruned = _layout.pre_process(int_data)     # returns dense tensor
         csr_tensor = pruned.to_sparse_csr() 
+        print(csr_tensor)
         return cls(csr_tensor, scale, zero_point, _layout)

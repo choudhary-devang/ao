@@ -1286,87 +1286,165 @@ class Int8DynamicActivationInt8WeightConfig(AOBaseConfig):
 # for BC
 int8_dynamic_activation_int8_weight = Int8DynamicActivationInt8WeightConfig
 
-
 @register_quantize_module_handler(Int8DynamicActivationInt8WeightConfig)
 def _int8_dynamic_activation_int8_weight_transform(
-    module: torch.nn.Module, config: Int8DynamicActivationInt8WeightConfig
+    module: torch.nn.Module,
+    config: Int8DynamicActivationInt8WeightConfig,
 ) -> torch.nn.Module:
-    layout = config.layout
-    print("we are in _int8_dynamic_activation_int8_weight_transform function")
-    print(layout)
-    act_mapping_type = config.act_mapping_type
-    weight_only_decode = config.weight_only_decode
-    if config.set_inductor_config:
+    # ------------------------------------------------------------------ #
+    # 0.  grab knobs and do trivial early-exit
+    # ------------------------------------------------------------------ #
+    layout             : Layout          = config.layout
+    act_mapping_type   : MappingType     = config.act_mapping_type
+    weight_only_decode : bool            = config.weight_only_decode
+
+    if config.set_inductor_config:          # keep perf hints for Inductor
         torchao.quantization.utils.recommended_inductor_config_setter()
 
     weight = module.weight
-
-    in_features = weight.shape[1]
-    # int8 dynamic quantization only has benefit when in_feature > 16
-    if in_features <= 16:
-        logger.info(
-            f"Skipping applying int8_dynamic_activation_int8_weight to weight of shape {weight.shape}"
-            f" because `in_feature` is <= 16: {in_features}"
-        )
+    if weight.shape[1] <= 16:               # small GEMMs → don’t bother
+        logger.info("Skip INT8 dyn-act for tiny in_features=%d", weight.shape[1])
         return module
 
-    # weight settings
-    mapping_type = MappingType.SYMMETRIC
-    weight_zero_point_domain = ZeroPointDomain.NONE
-
-    def get_weight_block_size(x):
-        return (1, x.shape[1])
-
-    target_dtype = torch.int8
-    eps = torch.finfo(torch.float32).eps
-    zero_point_dtype = torch.int64
-
+    # ------------------------------------------------------------------ #
+    # 1. pick dynamic-activation quant func (unchanged logic)
+    # ------------------------------------------------------------------ #
     if weight_only_decode:
-        input_quant_func = _int8_symm_per_token_reduced_range_quant_noop_decode
+        input_q_fn = _int8_symm_per_token_reduced_range_quant_noop_decode
     else:
-        # input settings
-        if act_mapping_type == MappingType.SYMMETRIC:
-            input_quant_func = _int8_symm_per_token_reduced_range_quant
-        else:
-            input_quant_func = _int8_asymm_per_token_quant
-
-    block_size = get_weight_block_size(weight)
-    # dense_q = to_affine_quantized_intx(                 # ← returns AQT w/ Plain layout
-    #     weight,
-    #     mapping_type,
-    #     block_size,
-    #     target_dtype,
-    #     eps=torch.finfo(torch.float32).eps,
-    #     zero_point_dtype=torch.int64,
-    #     zero_point_domain=ZeroPointDomain.NONE,
-    #     _layout=PlainLayout(),
-    # )
-
-    packed_weight = to_affine_quantized_intx(
-        weight,
-        mapping_type,
-        block_size,
-        target_dtype,
-        eps=eps,
-        zero_point_dtype=zero_point_dtype,
-        _layout=layout,
-        zero_point_domain=weight_zero_point_domain,
-    )
-    if isinstance(layout, CSRLayout):
-        # 3a. unpack dense_q to numpy-style triple (data, scale, zp)
-        dq_data, dq_scale, dq_zp = packed_weight.tensor_impl.get_plain()
-
-        # 3b. prune & compress -> CSR_AQTTensorImpl
-        pruned = layout.pre_process(dq_data.to(torch.int8))   # magnitude pruning
-        csr_impl = CSR_AQTTensorImpl.from_plain(              # packs to CSR
-            pruned, dq_scale, dq_zp, layout
+        input_q_fn = (
+            _int8_symm_per_token_reduced_range_quant
+            if act_mapping_type == MappingType.SYMMETRIC
+            else _int8_asymm_per_token_quant
         )
-        packed_weight = AffineQuantizedTensor(csr_impl)       # wrap back to AQT
-    
-    weight = to_linear_activation_quantized(packed_weight, input_quant_func)
-    module.weight = torch.nn.Parameter(weight, requires_grad=False)
+    block_size = (1, weight.shape[1]) 
+    # ------------------------------------------------------------------ #
+    # 2. dense INT8 quant-pack  (ALWAYS PlainLayout FIRST)
+    # ------------------------------------------------------------------ #
+    dense_q = to_affine_quantized_intx(
+        weight,
+        MappingType.SYMMETRIC,
+        (1, weight.shape[1]),                 # per-channel
+        torch.int8,
+        eps=torch.finfo(torch.float32).eps,
+        zero_point_dtype=torch.int64,
+        zero_point_domain=ZeroPointDomain.NONE,
+        _layout=PlainLayout(),                # force dense path
+    )
+
+    # ------------------------------------------------------------------ #
+    # 3. branch on desired final layout
+    # ------------------------------------------------------------------ #
+    if isinstance(layout, CSRLayout):                       # CPU sparse
+        # unpack → prune → CSR → TensorImpl
+        data, scale, zp = dense_q.tensor_impl.get_plain()
+        # pruned         = layout.pre_process(data.to(torch.int8))#magnitude prunning 
+        csr_impl       = CSR_AQTTensorImpl.from_plain(data.to(torch.int8), scale, zp, layout)
+        packed_weight = AffineQuantizedTensor(csr_impl, block_size, weight.shape)       # original 2-D (out, in)
+
+    elif isinstance(layout, SemiSparseLayout):              # 2:4 GPU path
+        packed_weight  = to_affine_quantized_intx(
+            weight,
+            MappingType.SYMMETRIC,
+            (1, weight.shape[1]),
+            torch.int8,
+            eps=torch.finfo(torch.float32).eps,
+            zero_point_dtype=torch.int64,
+            _layout=layout,
+            zero_point_domain=ZeroPointDomain.NONE,
+        )
+
+    else:                                                   # Plain, etc.
+        packed_weight  = dense_q
+
+    # ------------------------------------------------------------------ #
+    # 4. attach activation-quant metadata & finish
+    # ------------------------------------------------------------------ #
+    packed_weight = to_linear_activation_quantized(packed_weight, input_q_fn)
+    module.weight = torch.nn.Parameter(packed_weight, requires_grad=False)
     module.extra_repr = types.MethodType(_linear_extra_repr, module)
     return module
+
+# @register_quantize_module_handler(Int8DynamicActivationInt8WeightConfig)
+# def _int8_dynamic_activation_int8_weight_transform(
+#     module: torch.nn.Module, config: Int8DynamicActivationInt8WeightConfig
+# ) -> torch.nn.Module:
+#     layout = config.layout
+#     print("we are in _int8_dynamic_activation_int8_weight_transform function")
+#     print(layout)
+#     act_mapping_type = config.act_mapping_type
+#     weight_only_decode = config.weight_only_decode
+#     if config.set_inductor_config:
+#         torchao.quantization.utils.recommended_inductor_config_setter()
+
+#     weight = module.weight
+
+#     in_features = weight.shape[1]
+#     # int8 dynamic quantization only has benefit when in_feature > 16
+#     if in_features <= 16:
+#         logger.info(
+#             f"Skipping applying int8_dynamic_activation_int8_weight to weight of shape {weight.shape}"
+#             f" because `in_feature` is <= 16: {in_features}"
+#         )
+#         return module
+
+#     # weight settings
+#     mapping_type = MappingType.SYMMETRIC
+#     weight_zero_point_domain = ZeroPointDomain.NONE
+
+#     def get_weight_block_size(x):
+#         return (1, x.shape[1])
+
+#     target_dtype = torch.int8
+#     eps = torch.finfo(torch.float32).eps
+#     zero_point_dtype = torch.int64
+
+#     if weight_only_decode:
+#         input_quant_func = _int8_symm_per_token_reduced_range_quant_noop_decode
+#     else:
+#         # input settings
+#         if act_mapping_type == MappingType.SYMMETRIC:
+#             input_quant_func = _int8_symm_per_token_reduced_range_quant
+#         else:
+#             input_quant_func = _int8_asymm_per_token_quant
+
+#     block_size = get_weight_block_size(weight)
+#     # dense_q = to_affine_quantized_intx(                 # ← returns AQT w/ Plain layout
+#     #     weight,
+#     #     mapping_type,
+#     #     block_size,
+#     #     target_dtype,
+#     #     eps=torch.finfo(torch.float32).eps,
+#     #     zero_point_dtype=torch.int64,
+#     #     zero_point_domain=ZeroPointDomain.NONE,
+#     #     _layout=PlainLayout(),
+#     # )
+
+#     packed_weight = to_affine_quantized_intx(
+#         weight,
+#         mapping_type,
+#         block_size,
+#         target_dtype,
+#         eps=eps,
+#         zero_point_dtype=zero_point_dtype,
+#         _layout=layout,
+#         zero_point_domain=weight_zero_point_domain,
+#     )
+#     if isinstance(layout, CSRLayout):
+#         # 3a. unpack dense_q to numpy-style triple (data, scale, zp)
+#         dq_data, dq_scale, dq_zp = packed_weight.tensor_impl.get_plain()
+
+#         # 3b. prune & compress -> CSR_AQTTensorImpl
+#         pruned = layout.pre_process(dq_data.to(torch.int8))   # magnitude pruning
+#         csr_impl = CSR_AQTTensorImpl.from_plain(              # packs to CSR
+#             pruned, dq_scale, dq_zp, layout
+#         )
+#         packed_weight = AffineQuantizedTensor(csr_impl)       # wrap back to AQT
+    
+#     weight = to_linear_activation_quantized(packed_weight, input_quant_func)
+#     module.weight = torch.nn.Parameter(weight, requires_grad=False)
+#     module.extra_repr = types.MethodType(_linear_extra_repr, module)
+#     return module
 
 
 def int8_dynamic_activation_int8_semi_sparse_weight():
