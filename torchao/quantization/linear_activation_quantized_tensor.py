@@ -134,17 +134,38 @@ implements = LinearActivationQuantizedTensor.implements
 
 @implements([torch.nn.functional.linear, aten.linear.default])
 def _(func, types, args, kwargs):
-    input_tensor, weight_tensor, bias = (
+    input_tensor, weight_wrapper, bias = (
         args[0],
         args[1],
         args[2] if len(args) > 2 else None,
     )
-    if isinstance(weight_tensor, LinearActivationQuantizedTensor):
-        return weight_tensor._quantized_linear_op(input_tensor, weight_tensor, bias)
-
-    raise NotImplementedError(
-        "LinearActivationQuantizedTensor: No specialized dispatch found for linear op"
+    # Lazy import to avoid circular dependency: 
+    # linear_activation_quantized_tensor.py -> import csr_layout.py && csr_layout.py -> import linear_activation_quantized_tensor.py
+    from torchao.dtypes.uintx.csr_layout import (
+        CSR_AQTTensorImpl,
+        _linear_int8_act_int8_weight_csr_sparse_impl,
     )
+    if not isinstance(weight_wrapper, LinearActivationQuantizedTensor):
+        raise NotImplementedError("unexpected weight type")
+
+    # 1. dynamic-quantise the activation exactly as today
+    qt = weight_wrapper.input_quant_func(
+        input_tensor, **weight_wrapper.quant_kwargs
+    )
+
+    # 2. look at the *packed* weight
+    aqt_weight = weight_wrapper.original_weight_tensor
+    if (hasattr(aqt_weight, "tensor_impl") and
+            isinstance(aqt_weight.tensor_impl, CSR_AQTTensorImpl)):
+        # ---- sparse INT-8 path ----
+        return _linear_int8_act_int8_weight_csr_sparse_impl(
+            qt,                 # plain-layout INT-8 activation
+            aqt_weight,         # CSR-packed weight
+            bias,
+        )
+
+    # 3. fallback: existing dense path
+    return torch.nn.functional.linear(qt, aqt_weight, bias)
 
 
 @implements([aten.mm.default, aten.addmm.default])

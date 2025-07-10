@@ -83,6 +83,7 @@ def _linear_int8_act_int8_weight_csr_sparse_impl(
     * Produces *fp32* output multiplied by both quant scales, then casts back
       to original activation dtype.
     """
+    print("we are in _linear_int8_act_int8_weight_csr_sparse_impl function\n")
     x_vals_int8 = input_tensor.tensor_impl.int_data
     x_scale = input_tensor.tensor_impl.scale  # shape: (1,)
 
@@ -104,8 +105,11 @@ def _linear_int8_act_int8_weight_csr_sparse_impl(
     y_int32 = torch.mm(w_csr.to(torch.float32), x2d.t().to(torch.float32).contiguous()).t()
 
     # Dequantise: y = (x_scale * w_scale) * y_int32
-    y_fp32 = (y_int32.to(torch.float32) * x_scale * w_scale).reshape(
-        *x_vals_int8.shape[:-1], y_int32.shape[-1]
+    scale_mat = x_scale.view(-1, 1) * w_scale.view(1, -1)
+
+    y_fp32 = (y_int32.to(torch.float32) * scale_mat).reshape(
+        *x_vals_int8.shape[:-1],   # (B,)
+        y_int32.shape[-1]         # O
     )
 
     if bias is not None:
@@ -191,22 +195,67 @@ class CSR_AQTTensorImpl(PlainAQTTensorImpl):
         """
         return torch.sparse_csr
     
-    # ------------------------------------------------------------------
-    # Override torch dispatch for basic ops we need (detach, to_plain).
-    # ------------------------------------------------------------------
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args, kwargs):
+        """
+        Custom dispatch for tensors backed by **CSR_AQTTensorImpl**.
+
+        Fast-paths we cover
+
+        ╷ backend op                    ╷ typical call-site
+        ├───────────────────────────────┼────────────────────────────────────────
+        │ aten.linear.default           │ nn.Linear.forward(input, weight, bias)
+        │ aten.addmm.default            │ functional.linear → addmm(bias, x, Wᵀ)
+        │ aten.mm.default               │ any plain sparse-mm fallback
+        │ aten.detach.default           │ TorchAO save / FX flatten helpers
+        ╵                               ╵
+
+        Any other op raises ⇒ we notice missing coverage immediately.
+        """
         kwargs = kwargs or {}
-        print("in __torch_dispatch function")
+        print("CSR_AQT dispatch ➜", func)                 # remove once happy
+
+        # ───────────────────────────────────────────────────────── aten.linear
+        if func is aten.linear.default and len(args) == 3:
+            inp, weight_wrapped, bias = args
+            # `weight_wrapped` is a LinearActivationQuantizedTensor; dig out AQT
+            aqt = getattr(weight_wrapped, "original_weight_tensor", None)
+            if aqt is not None and isinstance(aqt.tensor_impl, cls):
+                return _linear_int8_act_int8_weight_csr_sparse_impl(inp, aqt, bias)
+
+        # ───────────────────────────────────────────────────────── aten.addmm
+        # Pattern produced by older PyTorch versions:
+        #     out = bias + inp @ weight.t()
+        if func is aten.addmm.default and len(args) >= 3:
+            bias, inp, mat2 = args[:3]                    # `beta/alpha` follow
+            # `mat2` **is already transposed** – simply detect CSR impl
+            if hasattr(mat2, "tensor_impl") and isinstance(mat2.tensor_impl, cls):
+                return _linear_int8_act_int8_weight_csr_sparse_impl(inp, mat2, bias)
+
+        # ─────────────────────────────────────────────────────────── aten.mm
+        if func is aten.mm.default and len(args) == 2:
+            lhs, rhs = args
+            # (a) weight sits on LHS
+            if hasattr(lhs, "tensor_impl") and isinstance(lhs.tensor_impl, cls):
+                return _linear_int8_act_int8_weight_csr_sparse_impl(rhs, lhs, None)
+            # (b) weight sits on RHS
+            if hasattr(rhs, "tensor_impl") and isinstance(rhs.tensor_impl, cls):
+                return _linear_int8_act_int8_weight_csr_sparse_impl(lhs, rhs, None)
+
+        # ─────────────────────────────────────────────────────────── detach
         if func is aten.detach.default:
+            # preserve aliasing semantics exactly like the stock op
             return return_and_correct_aliasing(
                 func, args, kwargs, args[0]._apply_fn_to_data(torch.detach)
             )
 
+        # ───────────────────────────────────────────────────────── fallback
         raise NotImplementedError(
-            f"CSR_AQTTensorImpl dispatch: attempted to run {func}, not supported."
+            f"CSR_AQTTensorImpl dispatch: un-handled op ‘{func}’.  "
+            "Add another fast-path above."
         )
+
 
     # ------------------------------ helpers ---------------------------
 
